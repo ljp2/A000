@@ -1,0 +1,17 @@
+Data/
+Data*/
+Processed*/
+HistData*/
+keys.py
+working*.*
+*,ipynb
+.env
+
+_pycache___/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+
+*.csv
+.requirements.txt
