@@ -284,11 +284,3 @@ def rolling_cubic_features(
     )
 
 
-if __name__ == "__main__":
-    demo_series = pd.Series(
-        [1.0, 1.5, 2.0, 2.5, 3.0],
-        index=pd.date_range("2025-01-01", periods=5, freq="D"),
-    )
-    demo_features = rolling_cubic_features(demo_series, window=4, prefix="3_")
-    print(demo_features)
-    
