@@ -15,3 +15,5 @@ _pycache___/
 
 *.csv
 .requirements.txt
+
+*.json
