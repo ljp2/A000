@@ -66,8 +66,11 @@ def add_normalizers(df: pd.DataFrame) -> pd.DataFrame:
     h = df["high"]
     l = df["low"]
     prev_c = c.shift(1)
+    if "session_date" in df.columns:
+        session_change = df["session_date"] != df["session_date"].shift(1)
+        prev_c = prev_c.where(~session_change, c)
 
-    df["lr_1"] = np.log(c / prev_c)
+    df["lr_1"] = np.log(c / (prev_c + EPS))
 
     tr1 = h - l
     tr2 = (h - prev_c).abs()
@@ -89,7 +92,7 @@ def add_normalizers(df: pd.DataFrame) -> pd.DataFrame:
 def add_return_features(df: pd.DataFrame) -> pd.DataFrame:
     ks = [1, 2, 3, 5, 10, 15, 30, 60]
     for k in ks:
-        lr_k = np.log(df["close"] / df["close"].shift(k))
+        lr_k = np.log(df["close"] / (df["close"].shift(k) + EPS))
         df[f"ret_lr_{k}"] = lr_k
         df[f"ret_atr_{k}"] = lr_k / (df["atr_ret_20"] + EPS)
 
@@ -195,14 +198,6 @@ def add_efficiency(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ============================================================
-# Acceleration features (robust)
-# ============================================================
-def add_accel_features(df: pd.DataFrame, lag: int = 5) -> pd.DataFrame:
-    df[f"ema_spread_accel_{lag}"] = df["ema_spread_atr"] - df["ema_spread_atr"].shift(lag)
-    df[f"vwapsess_pull_accel_{lag}"] = df["dist_vwapsess_atr"] - df["dist_vwapsess_atr"].shift(lag)
-    return df
-
-# ============================================================
 # Target
 # ============================================================
 def add_target(df: pd.DataFrame, horizon: int = 2, deadband_frac_atr: float = 0.05) -> pd.DataFrame:
@@ -244,7 +239,6 @@ def build_features_from_csv(path: str) -> pd.DataFrame:
     df = add_candle_anatomy(df)
     df = add_vol_regime(df)
     df = add_vwap_features(df)
-    df = add_accel_features(df, lag=5)
     df = add_hod_lod_features(df)
     df = add_volume_features(df)
     df = add_trade_count_features(df)

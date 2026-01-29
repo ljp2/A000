@@ -93,8 +93,11 @@ def add_normalizers(df: pd.DataFrame) -> pd.DataFrame:
     h = df["high"]
     l = df["low"]
     prev_c = c.shift(1)
+    if "session_date" in df.columns:
+        session_change = df["session_date"] != df["session_date"].shift(1)
+        prev_c = prev_c.where(~session_change, c)
 
-    df["lr_1"] = np.log(c / prev_c)
+    df["lr_1"] = np.log(c / (prev_c + EPS))
 
     tr1 = h - l
     tr2 = (h - prev_c).abs()
@@ -112,7 +115,7 @@ def add_normalizers(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_return_features(df: pd.DataFrame) -> pd.DataFrame:
     for k in [1,2,3,5,10,15,30,60]:
-        lr_k = np.log(df["close"] / df["close"].shift(k))
+        lr_k = np.log(df["close"] / (df["close"].shift(k) + EPS))
         df[f"ret_lr_{k}"] = lr_k
         df[f"ret_atr_{k}"] = lr_k / (df["atr_ret_20"] + EPS)
 
