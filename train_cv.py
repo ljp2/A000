@@ -7,6 +7,23 @@ from sklearn.metrics import log_loss, roc_auc_score
 EPS = 1e-12
 
 # ============================================================
+# Baseline versions
+# ============================================================
+BASELINE_VERSION = "v2" 
+
+# v2 = Regime-Conditional Deadband (RCD) label parameters (LOCKED)
+RCD_PARAMS = dict(
+    horizon=2,
+    deadband_base=0.05,
+    rv_low=0.90,
+    rv_high=1.10,
+    mult_low=0.85,
+    mult_mid=1.00,
+    mult_high=1.25,
+)
+
+
+# ============================================================
 # Helpers
 # ============================================================
 def ema(s: pd.Series, span: int) -> pd.Series:
@@ -210,31 +227,70 @@ def add_target(df: pd.DataFrame, horizon: int = 2, deadband_frac_atr: float = 0.
     df.loc[~keep, "y"] = np.nan
     return df
 
+def add_target_rcd(
+    df: pd.DataFrame,
+    horizon: int = 2,
+    deadband_base: float = 0.05,
+    rv_low: float = 0.90,
+    rv_high: float = 1.10,
+    mult_low: float = 0.85,
+    mult_mid: float = 1.00,
+    mult_high: float = 1.25,
+) -> pd.DataFrame:
+    fwd_lr = np.log(df["close"].shift(-horizon) / df["close"])
+    df["fwd_lr_2"] = fwd_lr
+    df["y"] = (fwd_lr > 0).astype(np.int8)
+
+    rv = df["rv_ratio_20_120"]
+    mult = np.where(rv < rv_low, mult_low, np.where(rv > rv_high, mult_high, mult_mid))
+
+    db = (deadband_base * mult) * df["atr_ret_20"]
+    keep = fwd_lr.abs() > db
+    df.loc[~keep, "y"] = np.nan
+    return df
+
+
+
 # ============================================================
 # Build features
 # ============================================================
-def build_features_from_csv(path: str) -> pd.DataFrame:
+def build_features_from_csv(path: str, baseline_version: str = None) -> pd.DataFrame:
+    if baseline_version is None:
+        baseline_version = BASELINE_VERSION
+
     df = pd.read_csv(path, parse_dates=["timestamp"])
     df.columns = [c.strip().lower() for c in df.columns]
-
     df = df.set_index("timestamp").sort_index()
 
-    # Use full input schema including vwp
-    needed = ["open","high","low","close","volume","trade_count","vwp"]
+    # Required raw inputs
+    needed = ["open", "high", "low", "close", "volume", "trade_count", "vwp"]
     missing = [c for c in needed if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns in {path}: {missing}")
 
     df = df[needed].astype(float)
 
+    # ============================================================
+    # Session / time
+    # ============================================================
     df = enforce_rth(df)
     df = add_session_keys(df)
     df = add_time_of_day(df)
 
+    # ============================================================
+    # Session anchors
+    # ============================================================
     df = add_session_anchors(df)
     df = add_session_cum_vwap(df)
 
+    # ============================================================
+    # Normalizers
+    # ============================================================
     df = add_normalizers(df)
+
+    # ============================================================
+    # Feature blocks (baseline-v1 feature set)
+    # ============================================================
     df = add_return_features(df)
     df = add_candle_anatomy(df)
     df = add_vol_regime(df)
@@ -244,9 +300,18 @@ def build_features_from_csv(path: str) -> pd.DataFrame:
     df = add_trade_count_features(df)
     df = add_efficiency(df)
 
-    df = add_target(df, horizon=2, deadband_frac_atr=0.05)
+    # ============================================================
+    # Target (baseline version switch)
+    # ============================================================
+    if baseline_version == "v1":
+        df = add_target(df, horizon=2, deadband_frac_atr=0.05)
+    elif baseline_version == "v2":
+        df = add_target_rcd(df, **RCD_PARAMS)
+    else:
+        raise ValueError(f"Unknown baseline_version: {baseline_version}")
 
     return df.copy()  # defragment
+
 
 # ============================================================
 # Final X / y
@@ -360,16 +425,84 @@ def eval_thresholds(oof, thresholds):
 # ============================================================
 # Train + evaluate
 # ============================================================
+def quick_per_fold_check(
+    oof_base: pd.DataFrame,
+    oof_branch: pd.DataFrame,
+    thresholds=(0.55, 0.56, 0.57, 0.58, 0.59, 0.60),
+):
+    """
+    Per-fold robustness check comparing baseline vs branch.
+    Computes realized returns exactly like your threshold policy:
+      long if p_up >= t
+      short if p_up <= (1 - t)
+
+    Returns a summary per threshold:
+      - folds_pos: number of folds with positive uplift (branch - base)
+      - mean_uplift_abs: mean uplift in avg_lr (absolute)
+      - mean_uplift_pct: mean uplift relative to |base avg_lr|
+      - mean_trade_diff: mean change in number of trades
+    """
+    rows = []
+
+    for t in thresholds:
+        for fold in sorted(oof_base["fold"].unique()):
+            gb = oof_base[oof_base["fold"] == fold]
+            gh = oof_branch[oof_branch["fold"] == fold]
+
+            def realized_rets(g):
+                lr = g["fwd_lr_2"]
+                long = lr[g["p_up"] >= t]
+                short = -lr[g["p_up"] <= (1 - t)]
+                return pd.concat([long, short])
+
+            rb = realized_rets(gb)
+            rh = realized_rets(gh)
+
+            # If either side has no trades, skip that fold/threshold
+            if len(rb) == 0 or len(rh) == 0:
+                continue
+
+            base_mean = rb.mean()
+            branch_mean = rh.mean()
+
+            rows.append({
+                "threshold": float(t),
+                "fold": int(fold),
+                "base_avg_lr": float(base_mean),
+                "branch_avg_lr": float(branch_mean),
+                "uplift_abs": float(branch_mean - base_mean),
+                "uplift_pct": float((branch_mean - base_mean) / (abs(base_mean) + EPS)),
+                "trade_diff": int(len(rh) - len(rb)),
+            })
+
+    df = pd.DataFrame(rows)
+
+    summary = (
+        df.groupby("threshold")
+          .agg(
+              folds_pos=("uplift_abs", lambda x: int((x > 0).sum())),
+              mean_uplift_abs=("uplift_abs", "mean"),
+              mean_uplift_pct=("uplift_pct", "mean"),
+              mean_trade_diff=("trade_diff", "mean"),
+          )
+          .reset_index()
+          .sort_values("threshold")
+    )
+
+    print("\n==== PER-FOLD THRESHOLD ROBUSTNESS (RCD vs BASELINE) ====")
+    print(summary.to_string(index=False))
+
+    # Optional: show per-fold detail if you want to inspect
+    # print("\nPer-fold details:")
+    # print(df.sort_values(["threshold","fold"]).to_string(index=False))
+
+    return summary
+
 def main():
-    feat_df = build_features_from_csv("SPY_1min_RTH_full.csv")
-    feat_df_nonan = feat_df.dropna().copy()
+    path = "SPY_1min_RTH_full.csv"
 
-    X, y = finalize_xy(feat_df)
-    print("Num features:", X.shape[1])
-    print("X shape:", X.shape)
-    print("y distribution:", y.value_counts(normalize=True).to_dict())
-
-    splits = list(purged_day_splits(feat_df_nonan, n_splits=5, purge_minutes=2))
+    print(f"\n=== Running baseline-{BASELINE_VERSION} ===")
+    print("RCD params:", RCD_PARAMS if BASELINE_VERSION == "v2" else "N/A")
 
     params = dict(
         n_estimators=500,
@@ -386,21 +519,61 @@ def main():
         n_jobs=-1
     )
 
-    # ----------------------------
-    # NOW COLLECT OOF PREDICTIONS
-    # ----------------------------
-    oof = collect_oof_predictions(X, y, feat_df_nonan, splits, params)
-    print("OOF rows:", len(oof))
+    thresholds = np.arange(0.50, 0.65, 0.01)
+
+    # ============================================================
+    # Build features + labels (baseline-v2 by default)
+    # ============================================================
+    feat_df = build_features_from_csv(path)
+    feat_df_nonan = feat_df.dropna().copy()
+
+    X, y = finalize_xy(feat_df_nonan)
+
+    print("\n==== DATA SNAPSHOT ====")
+    print("Rows:", len(X))
+    print("Features:", X.shape[1])
+    print("y mean:", float(y.mean()))
+
+    # ============================================================
+    # Purged day CV splits
+    # ============================================================
+    splits = list(purged_day_splits(
+        feat_df_nonan,
+        n_splits=5,
+        purge_minutes=2
+    ))
+
+    # ============================================================
+    # Collect OOF predictions
+    # ============================================================
+    oof = collect_oof_predictions(
+        X,
+        y,
+        feat_df_nonan,
+        splits,
+        params
+    )
+
+    print("\nOOF rows:", len(oof))
     print(oof.head())
 
-
-    thresholds = np.arange(0.50, 0.65, 0.01)
+    # ============================================================
+    # Threshold evaluation (policy-level)
+    # ============================================================
     stats = eval_thresholds(oof, thresholds)
-    print(stats)
 
+    print("\n==== THRESHOLD STATS (baseline-v2) ====")
+    print(stats.to_string(index=False))
 
+    # Save for later analysis
+    out_csv = f"threshold_stats_baseline_{BASELINE_VERSION}.csv"
+    stats.to_csv(out_csv, index=False)
+    print(f"\nWrote: {out_csv}")
+
+    # ============================================================
+    # Fold-level model diagnostics
+    # ============================================================
     scores = []
-
     for i, (tr_idx, va_idx) in enumerate(splits):
         model = XGBClassifier(**params)
         model.fit(X.loc[tr_idx], y.loc[tr_idx])
@@ -412,8 +585,13 @@ def main():
         scores.append((ll, auc))
         print(f"Fold {i}: logloss={ll:.5f}  AUC={auc:.5f}")
 
-    print("\nMean logloss:", float(np.mean([s[0] for s in scores])))
-    print("Mean AUC    :", float(np.mean([s[1] for s in scores])))
+    mean_ll = float(np.mean([s[0] for s in scores]))
+    mean_auc = float(np.mean([s[1] for s in scores]))
+
+    print("\n==== CV SUMMARY (baseline-v2) ====")
+    print("Mean logloss:", mean_ll)
+    print("Mean AUC    :", mean_auc)
+
 
 if __name__ == "__main__":
     main()
