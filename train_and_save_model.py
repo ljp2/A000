@@ -51,11 +51,12 @@ XGB_PARAMS = dict(
 
 # Policy thresholds (calibrated later)
 POLICY = dict(
-    LONG_ENTER=0.60,
-    SHORT_ENTER=0.40,
+    LONG_ENTER=0.59,
+    SHORT_ENTER=0.41,
     LONG_EXIT=0.52,
     SHORT_EXIT=0.48,
 )
+
 
 # ------------------------------------------------------------
 # Helpers
